@@ -16,10 +16,12 @@ _conn = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    tg_id      INTEGER PRIMARY KEY,
-    username   TEXT,
-    first_name TEXT,
-    created_at INTEGER NOT NULL
+    tg_id         INTEGER PRIMARY KEY,
+    username      TEXT,
+    first_name    TEXT,
+    reseller_pct  INTEGER NOT NULL DEFAULT 0,
+    active_coupon TEXT,
+    created_at    INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS plans (
@@ -43,6 +45,9 @@ CREATE TABLE IF NOT EXISTS orders (
     kind           TEXT NOT NULL,
     service_id     INTEGER,
     amount         INTEGER NOT NULL,
+    base_amount    INTEGER,
+    discount       INTEGER NOT NULL DEFAULT 0,
+    coupon_code    TEXT,
     status         TEXT NOT NULL,
     attempts       INTEGER NOT NULL DEFAULT 0,
     created_at     INTEGER NOT NULL,
@@ -91,7 +96,38 @@ CREATE TABLE IF NOT EXISTS events (
     service_id INTEGER,
     detail     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS coupons (
+    code       TEXT PRIMARY KEY,
+    percent    INTEGER NOT NULL,
+    max_uses   INTEGER NOT NULL DEFAULT 0,
+    used       INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
 """
+
+# Kolom yang ditambahkan setelah versi pertama. Database lama tetap dipakai
+# apa adanya; kolom baru disisipkan lewat ALTER TABLE saat bot start.
+_MIGRATIONS = [
+    ("users", "reseller_pct", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "active_coupon", "TEXT"),
+    ("orders", "base_amount", "INTEGER"),
+    ("orders", "discount", "INTEGER NOT NULL DEFAULT 0"),
+    ("orders", "coupon_code", "TEXT"),
+]
+
+
+def _migrate():
+    """Tambah kolom baru kalau belum ada. Aman dijalankan berulang."""
+    for table, column, decl in _MIGRATIONS:
+        rows = _conn.execute("PRAGMA table_info(" + table + ")").fetchall()
+        names = [r["name"] for r in rows]
+        if column not in names:
+            _conn.execute(
+                "ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl
+            )
 
 
 def connect(path):
@@ -105,6 +141,7 @@ def connect(path):
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=FULL")
         _conn.executescript(SCHEMA)
+        _migrate()
         _conn.commit()
     return _conn
 
@@ -173,6 +210,110 @@ def count_users():
     return row["n"] if row else 0
 
 
+def get_user(tg_id):
+    return _one("SELECT * FROM users WHERE tg_id=?", (tg_id,))
+
+
+def set_active_coupon(tg_id, code):
+    """Kupon yang dipilih pelanggan, dipakai pada pesanan berikutnya."""
+    _exec("UPDATE users SET active_coupon=? WHERE tg_id=?", (code, tg_id))
+
+
+def get_active_coupon(tg_id):
+    row = get_user(tg_id)
+    return row["active_coupon"] if row else None
+
+
+# ------------------------------------------------------------------ reseller
+def set_reseller(tg_id, percent, now=None):
+    """Diskon permanen untuk reseller, dalam persen. 0 = bukan reseller."""
+    percent = max(0, min(90, int(percent)))
+    upsert_user(tg_id, now=now)
+    _exec("UPDATE users SET reseller_pct=? WHERE tg_id=?", (percent, tg_id))
+    return percent
+
+
+def get_reseller_pct(tg_id):
+    row = get_user(tg_id)
+    if row is None:
+        return 0
+    try:
+        return int(row["reseller_pct"] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 0
+
+
+def list_resellers():
+    return _all(
+        "SELECT * FROM users WHERE reseller_pct>0 ORDER BY reseller_pct DESC, tg_id"
+    )
+
+
+# ------------------------------------------------------------------ coupons
+def add_coupon(code, percent, max_uses=0, expires_at=None, now=None):
+    code = str(code).strip().upper()
+    percent = max(1, min(90, int(percent)))
+    _exec(
+        """INSERT INTO coupons (code, percent, max_uses, used, expires_at,
+                                enabled, created_at)
+           VALUES (?,?,?,0,?,1,?)
+           ON CONFLICT(code) DO UPDATE SET
+             percent=excluded.percent, max_uses=excluded.max_uses,
+             expires_at=excluded.expires_at, enabled=1""",
+        (code, percent, max(0, int(max_uses or 0)), expires_at, now or _now()),
+    )
+    return get_coupon(code)
+
+
+def get_coupon(code):
+    if not code:
+        return None
+    return _one("SELECT * FROM coupons WHERE code=?", (str(code).strip().upper(),))
+
+
+def list_coupons(only_enabled=False):
+    if only_enabled:
+        return _all("SELECT * FROM coupons WHERE enabled=1 ORDER BY code")
+    return _all("SELECT * FROM coupons ORDER BY enabled DESC, code")
+
+
+def set_coupon_enabled(code, enabled):
+    cur = _exec(
+        "UPDATE coupons SET enabled=? WHERE code=?",
+        (1 if enabled else 0, str(code).strip().upper()),
+    )
+    return cur.rowcount == 1
+
+
+def claim_coupon(code, now=None):
+    """Pesan satu slot pemakaian kupon.
+
+    UPDATE bersyarat, jadi kuota tidak bisa kebobolan walau dua pelanggan
+    menekan tombol beli di detik yang sama.
+    """
+    if not code:
+        return False
+    cur = _exec(
+        """UPDATE coupons SET used=used+1
+           WHERE code=? AND enabled=1
+             AND (expires_at IS NULL OR expires_at>?)
+             AND (max_uses=0 OR used<max_uses)""",
+        (str(code).strip().upper(), now or _now()),
+    )
+    return cur.rowcount == 1
+
+
+def release_coupon(code):
+    """Balikkan slot kupon kalau order batal atau hangus."""
+    if not code:
+        return
+    _exec(
+        """UPDATE coupons SET used = CASE WHEN used>0 THEN used-1 ELSE 0 END
+           WHERE code=?""",
+        (str(code).strip().upper(),),
+    )
+
+
 # ------------------------------------------------------------------ plans
 def add_plan(plan_id, name, cpu, ram_mb, disk_gb, price, period_days,
              template_vmid=None, os_label=None, sort_order=0):
@@ -207,12 +348,16 @@ def list_plans(only_enabled=True):
 
 # ------------------------------------------------------------------ orders
 def create_order(order_id, tg_id, plan_id, kind, amount, expires_at,
-                 service_id=None, now=None):
+                 service_id=None, now=None, base_amount=None, discount=0,
+                 coupon_code=None):
     _exec(
         """INSERT INTO orders (id, tg_id, plan_id, kind, service_id, amount,
+                               base_amount, discount, coupon_code,
                                status, created_at, expires_at)
-           VALUES (?,?,?,?,?,?,'pending',?,?)""",
-        (order_id, tg_id, plan_id, kind, service_id, amount, now or _now(), expires_at),
+           VALUES (?,?,?,?,?,?,?,?,?,'pending',?,?)""",
+        (order_id, tg_id, plan_id, kind, service_id, amount,
+         base_amount if base_amount is not None else amount,
+         int(discount or 0), coupon_code, now or _now(), expires_at),
     )
     return get_order(order_id)
 
@@ -294,10 +439,18 @@ def cancel_order(order_id):
 
 def expire_stale_orders(now=None):
     now = now or _now()
+    # kupon pada order yang hangus harus dikembalikan, bukan ikut hangus
+    stale = _all(
+        """SELECT coupon_code FROM orders
+           WHERE status='pending' AND expires_at<=? AND coupon_code IS NOT NULL""",
+        (now,),
+    )
     cur = _exec(
         "UPDATE orders SET status='expired' WHERE status='pending' AND expires_at<=?",
         (now,),
     )
+    for row in stale:
+        release_coupon(row["coupon_code"])
     return cur.rowcount
 
 
@@ -467,10 +620,15 @@ def ip_usage():
 def stats(now=None):
     now = now or _now()
     revenue = _one("SELECT COALESCE(SUM(amount),0) AS s FROM orders WHERE status='done'")
+    discount = _one(
+        "SELECT COALESCE(SUM(discount),0) AS s FROM orders WHERE status='done'"
+    )
     used_ip, total_ip = ip_usage()
     return {
         "users": count_users(),
         "revenue": revenue["s"] if revenue else 0,
+        "discount_given": discount["s"] if discount else 0,
+        "resellers": len(list_resellers()),
         "active": len(list_by_status("active")),
         "suspended": len(list_by_status("suspended")),
         "terminated": len(list_by_status("terminated")),
