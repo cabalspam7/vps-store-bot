@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: vps-store-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # database ditaruh di volume supaya data selamat saat container dibangun ulang
+      - ./data:/app/data
+    ports:
+      # buka hanya kalau WEBHOOK_PORT diisi di .env
+      - "8080:8080"

@@ -1,0 +1,10 @@
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+mock_provider.json
+*.json.tmp
+__pycache__/
+*.py[cod]
+.venv/
