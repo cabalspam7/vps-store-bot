@@ -2,7 +2,7 @@
 
 import time
 
-from . import config, db, pakasir, provision, tg
+from . import config, db, pakasir, pricing, provision, tg
 
 _provider = None
 MAX_PENDING_ORDERS = 3
@@ -39,7 +39,17 @@ def welcome_text():
     )
 
 
-def plans_view():
+def discount_note(tg_id):
+    """Satu baris info diskon yang sedang menempel di akun pelanggan."""
+    if tg_id is None:
+        return ""
+    q = pricing.quote(tg_id, 100000)
+    if q["discount"] <= 0:
+        return ""
+    return pricing.discount_label(q) + " aktif, otomatis dipakai saat checkout."
+
+
+def plans_view(tg_id=None):
     plans = db.list_plans()
     if not plans:
         return "Belum ada paket tersedia.", [back_button()]
@@ -61,14 +71,29 @@ def plans_view():
             "callback_data": "plan:" + plan["id"],
         }])
 
+    note = discount_note(tg_id)
+    if note:
+        lines.append(note)
+        lines.append("")
+
     keyboard.append(back_button())
     return "\n".join(lines), keyboard
 
 
-def plan_detail_view(plan_id):
+def plan_detail_view(plan_id, tg_id=None):
     plan = db.get_plan(plan_id)
     if plan is None or not plan["enabled"]:
         return "Paket tidak tersedia.", [back_button("plans")]
+
+    harga = "<b>Harga: " + provision.rupiah(plan["price"]) + "</b>\n\n"
+    if tg_id is not None:
+        q = pricing.quote(tg_id, int(plan["price"]))
+        if q["discount"] > 0:
+            harga = (
+                "Harga normal: <s>" + provision.rupiah(q["base"]) + "</s>\n"
+                + tg.escape(pricing.discount_label(q)) + "\n"
+                "<b>Bayar: " + provision.rupiah(q["amount"]) + "</b>\n\n"
+            )
 
     text = (
         "<b>" + tg.escape(plan["name"]) + "</b>\n\n"
@@ -77,7 +102,7 @@ def plan_detail_view(plan_id):
         "Disk: " + str(plan["disk_gb"]) + " GB\n"
         "OS: " + tg.escape(plan["os_label"] or "-") + "\n"
         "Masa aktif: " + str(plan["period_days"]) + " hari\n\n"
-        "<b>Harga: " + provision.rupiah(plan["price"]) + "</b>\n\n"
+        + harga +
         "Setelah pembayaran terkonfirmasi, VPS dibuat otomatis dan data login "
         "dikirim ke chat ini."
     )
@@ -173,10 +198,24 @@ def service_detail_view(tg_id, service_id):
 def payment_view(order, plan, kind="new"):
     url = pakasir.checkout_url(order["id"], order["amount"])
     judul = "Perpanjangan" if kind == "renew" else "Pesanan Baru"
+
+    rincian = ""
+    if order["discount"]:
+        if order["coupon_code"]:
+            label = "Kupon " + tg.escape(str(order["coupon_code"]))
+        else:
+            label = "Diskon reseller"
+        rincian = (
+            "Harga normal: <s>"
+            + provision.rupiah(order["base_amount"] or order["amount"]) + "</s>\n"
+            + label + ": -" + provision.rupiah(order["discount"]) + "\n"
+        )
+
     text = (
         "<b>" + judul + "</b>\n\n"
         "Order: <code>" + order["id"] + "</code>\n"
         "Paket: " + tg.escape(plan["name"]) + "\n"
+        + rincian +
         "Total: <b>" + provision.rupiah(order["amount"]) + "</b>\n\n"
         "Bayar pakai QRIS lewat tombol di bawah. Setelah bayar, VPS diproses "
         "otomatis dalam beberapa detik.\n\n"
@@ -197,6 +236,7 @@ def help_text():
         "/plans - lihat paket VPS",
         "/myvps - VPS milikmu &amp; perpanjangan",
         "/orders - riwayat pesanan",
+        "/kupon KODE - pakai kode diskon (/kupon hapus untuk melepas)",
         "",
         "<b>Cara kerja</b>",
         "1. Pilih paket lalu bayar QRIS",
@@ -222,11 +262,26 @@ def create_order_for(tg_id, plan, kind="new", service_id=None, now=None):
     now = now or int(time.time())
     order_id = provision.new_order_id()
     expires_at = now + config.ORDER_EXPIRE_MINUTES * 60
+    base = int(plan["price"])
+
+    q = pricing.quote(tg_id, base, now=now)
+    if q["source"] == "coupon" and q["coupon_code"]:
+        # slot kupon dipesan sekarang; kalau kuota habis persis di detik ini,
+        # pelanggan tetap bisa lanjut dengan harga tanpa kupon
+        claimed = db.claim_coupon(q["coupon_code"], now=now)
+        db.set_active_coupon(tg_id, None)
+        if not claimed:
+            q = pricing.quote(tg_id, base, now=now, use_active=False)
+
     db.create_order(
-        order_id, tg_id, plan["id"], kind, int(plan["price"]), expires_at,
-        service_id, now,
+        order_id, tg_id, plan["id"], kind, q["amount"], expires_at,
+        service_id, now, base_amount=q["base"], discount=q["discount"],
+        coupon_code=q["coupon_code"],
     )
-    db.log_event("order_created", kind, order_id, service_id, now)
+    detail = kind
+    if q["discount"] > 0:
+        detail = kind + " | " + pricing.discount_label(q)
+    db.log_event("order_created", detail, order_id, service_id, now)
     return db.get_order(order_id)
 
 
@@ -274,7 +329,14 @@ def admin_help():
         "/stopvps &lt;service_id&gt; - stop sekarang\n"
         "/startvps &lt;service_id&gt; - nyalakan &amp; set aktif\n"
         "/addip ip1,ip2 - tambah IP ke pool\n"
-        "/events - 15 kejadian terakhir"
+        "/events - 15 kejadian terakhir\n\n"
+        "<b>Diskon</b>\n"
+        "/addkupon KODE|persen|maks_pakai|berlaku_hari\n"
+        "   maks_pakai 0 = tanpa batas, berlaku_hari 0 = tanpa kedaluwarsa\n"
+        "/delkupon KODE - matikan kupon\n"
+        "/kupons - daftar kupon &amp; pemakaiannya\n"
+        "/reseller &lt;tg_id&gt; &lt;persen&gt; - diskon permanen (0 = cabut)\n"
+        "/resellers - daftar reseller"
     )
 
 
@@ -295,8 +357,99 @@ def handle_admin(chat_id, tg_id, text):
             "Order pending: " + str(s["pending_orders"]) + "\n"
             "Order gagal: " + str(s["failed_orders"]) + "\n"
             "IP terpakai: " + str(s["ip_used"]) + "/" + str(s["ip_total"]) + "\n"
-            "Pendapatan: " + provision.rupiah(s["revenue"]),
+            "Reseller: " + str(s["resellers"]) + "\n"
+            "Pendapatan: " + provision.rupiah(s["revenue"]) + "\n"
+            "Diskon diberikan: " + provision.rupiah(s["discount_given"]),
         )
+        return True
+
+    if command == "/addkupon":
+        fields = [f.strip() for f in rest.split("|")]
+        if len(fields) < 2:
+            tg.send(chat_id, "Format:\n/addkupon KODE|persen|maks_pakai|berlaku_hari")
+            return True
+        try:
+            code = fields[0].upper()
+            percent = int(fields[1])
+            max_uses = int(fields[2]) if len(fields) > 2 and fields[2] else 0
+            days = int(fields[3]) if len(fields) > 3 and fields[3] else 0
+        except ValueError:
+            tg.send(chat_id, "persen, maks_pakai, dan berlaku_hari harus angka.")
+            return True
+        if percent < 1 or percent > 90:
+            tg.send(chat_id, "Persen harus antara 1 dan 90.")
+            return True
+        now = int(time.time())
+        expires_at = now + days * 86400 if days > 0 else None
+        coupon = db.add_coupon(code, percent, max_uses, expires_at, now)
+        db.log_event("coupon_added", code + " " + str(percent) + "%", now=now)
+        tg.send(
+            chat_id,
+            "Kupon <code>" + tg.escape(coupon["code"]) + "</code> aktif.\n"
+            "Diskon: " + str(coupon["percent"]) + "%\n"
+            "Kuota: " + (str(coupon["max_uses"]) if coupon["max_uses"] else "tanpa batas") + "\n"
+            "Berlaku sampai: "
+            + (provision.fmt_expiry(coupon["expires_at"]) if coupon["expires_at"] else "tanpa batas"),
+        )
+        return True
+
+    if command == "/delkupon":
+        if db.set_coupon_enabled(rest, False):
+            tg.send(chat_id, "Kupon dimatikan.")
+        else:
+            tg.send(chat_id, "Kupon tidak ditemukan.")
+        return True
+
+    if command == "/kupons":
+        rows = db.list_coupons()
+        if not rows:
+            tg.send(chat_id, "Belum ada kupon. Buat dengan /addkupon")
+            return True
+        lines = []
+        for c in rows:
+            kuota = str(c["used"]) + "/" + (str(c["max_uses"]) if c["max_uses"] else "~")
+            masa = provision.fmt_expiry(c["expires_at"]) if c["expires_at"] else "tanpa batas"
+            lines.append(
+                ("[aktif] " if c["enabled"] else "[mati]  ")
+                + c["code"] + " - " + str(c["percent"]) + "% - dipakai " + kuota
+                + " - " + masa
+            )
+        tg.send(chat_id, "<b>Kupon</b>\n\n" + tg.escape("\n".join(lines)))
+        return True
+
+    if command == "/reseller":
+        bits = rest.split()
+        if len(bits) != 2:
+            tg.send(chat_id, "Format: /reseller <tg_id> <persen>")
+            return True
+        try:
+            target = int(bits[0])
+            percent = int(bits[1])
+        except ValueError:
+            tg.send(chat_id, "tg_id dan persen harus angka.")
+            return True
+        percent = db.set_reseller(target, percent)
+        db.log_event("reseller_set", str(target) + " " + str(percent) + "%")
+        if percent > 0:
+            tg.send(chat_id, "User " + str(target) + " jadi reseller, diskon "
+                    + str(percent) + "% untuk semua pembelian &amp; perpanjangan.")
+            tg.send(target, "Akunmu diaktifkan sebagai reseller. Diskon "
+                    + str(percent) + "% otomatis berlaku di semua paket.")
+        else:
+            tg.send(chat_id, "Status reseller user " + str(target) + " dicabut.")
+        return True
+
+    if command == "/resellers":
+        rows = db.list_resellers()
+        if not rows:
+            tg.send(chat_id, "Belum ada reseller. Set dengan /reseller <tg_id> <persen>")
+            return True
+        lines = []
+        for u in rows:
+            nama = u["username"] or u["first_name"] or "-"
+            lines.append(str(u["tg_id"]) + " - " + str(nama) + " - "
+                         + str(u["reseller_pct"]) + "%")
+        tg.send(chat_id, "<b>Reseller</b>\n\n" + tg.escape("\n".join(lines)))
         return True
 
     if command == "/addplan":
@@ -443,8 +596,54 @@ def handle_message(message):
         tg.send(chat_id, welcome_text(), main_menu())
         return
 
+    if command == "/kupon":
+        bits = text.split(maxsplit=1)
+        code = bits[1].strip().upper() if len(bits) > 1 else ""
+
+        if code in ("", "CEK"):
+            current = db.get_active_coupon(tg_id)
+            pct = db.get_reseller_pct(tg_id)
+            lines = []
+            if current:
+                lines.append("Kupon terpasang: <code>" + tg.escape(current) + "</code>")
+            if pct > 0:
+                lines.append("Diskon reseller: " + str(pct) + "%")
+            if not lines:
+                lines.append("Belum ada diskon terpasang.")
+            lines.append("")
+            lines.append("Pakai kupon: <code>/kupon KODE</code>")
+            lines.append("Lepas kupon: <code>/kupon hapus</code>")
+            tg.send(chat_id, "\n".join(lines))
+            return
+
+        if code in ("HAPUS", "BATAL", "OFF"):
+            db.set_active_coupon(tg_id, None)
+            tg.send(chat_id, "Kupon dilepas. Harga kembali normal.")
+            return
+
+        coupon, problem = pricing.usable_coupon(code)
+        if problem:
+            tg.send(chat_id, problem + "\n\nCek lagi kodenya, atau tanya admin.")
+            return
+
+        db.set_active_coupon(tg_id, coupon["code"])
+        pct = db.get_reseller_pct(tg_id)
+        pesan = (
+            "Kupon <code>" + tg.escape(coupon["code"]) + "</code> terpasang: diskon "
+            + str(coupon["percent"]) + "%.\n\n"
+            "Otomatis dipakai di pesanan berikutnya."
+        )
+        if pct >= int(coupon["percent"]):
+            pesan += (
+                "\n\nCatatan: diskon resellermu " + str(pct)
+                + "% sudah sama atau lebih besar, jadi yang dipakai tetap yang "
+                "paling menguntungkan buat kamu."
+            )
+        tg.send(chat_id, pesan, main_menu())
+        return
+
     if command == "/plans":
-        body, keyboard = plans_view()
+        body, keyboard = plans_view(tg_id)
         tg.send(chat_id, body, keyboard)
         return
 
@@ -494,7 +693,7 @@ def handle_callback(query):
 
     if data == "plans":
         tg.answer_callback(callback_id)
-        body, keyboard = plans_view()
+        body, keyboard = plans_view(tg_id)
         tg.edit(chat_id, message_id, body, keyboard)
         return
 
@@ -511,7 +710,7 @@ def handle_callback(query):
 
     if data.startswith("plan:"):
         tg.answer_callback(callback_id)
-        body, keyboard = plan_detail_view(data[5:])
+        body, keyboard = plan_detail_view(data[5:], tg_id)
         tg.edit(chat_id, message_id, body, keyboard)
         return
 
@@ -595,6 +794,7 @@ def handle_callback(query):
             tg.answer_callback(callback_id, "Order tidak ditemukan.", True)
             return
         if db.cancel_order(order_id):
+            db.release_coupon(order["coupon_code"])
             pakasir.cancel(order_id, order["amount"])
             tg.answer_callback(callback_id, "Order dibatalkan.")
             tg.edit(chat_id, message_id, "Order dibatalkan.", main_menu())
