@@ -111,6 +111,7 @@ WantedBy=multi-user.target
 | `/plans` | daftar paket |
 | `/myvps` | VPS milik sendiri + tombol perpanjang + lihat data login |
 | `/orders` | riwayat pesanan |
+| `/kupon KODE` | pasang kode diskon (`/kupon hapus` untuk melepas) |
 | `/help` | penjelasan alur |
 
 ### Admin
@@ -126,6 +127,52 @@ WantedBy=multi-user.target
 | `/startvps <id>` | nyalakan VPS |
 | `/addip ip1,ip2` | tambah IP ke pool |
 | `/events` | 15 kejadian terakhir |
+| `/addkupon KODE\|persen\|maks_pakai\|berlaku_hari` | bikin / ubah kupon |
+| `/delkupon KODE` | matikan kupon |
+| `/kupons` | daftar kupon + jumlah pemakaian |
+| `/reseller <tg_id> <persen>` | diskon permanen; `0` mencabut |
+| `/resellers` | daftar reseller |
+
+---
+
+## Diskon & reseller
+
+Dua cara memberi harga khusus, dengan satu mesin perhitungan yang sama.
+
+**Kupon** dibuat admin, dipasang sendiri oleh pelanggan:
+
+```
+/addkupon LAUNCH30|30|50|7
+```
+
+Diskon 30%, kuota 50 pemakaian, berlaku 7 hari. Isi `0` pada kuota atau masa
+berlaku untuk tanpa batas. Pelanggan mengetik `/kupon LAUNCH30`, lalu harga
+coret langsung muncul di detail paket dan di tagihan.
+
+**Reseller** tidak perlu kode. Diskonnya menempel di akun dan otomatis berlaku
+untuk semua pembelian *dan* perpanjangan:
+
+```
+/reseller 123456789 25
+```
+
+Aturan yang dipegang:
+
+- Diskon tidak ditumpuk. Kalau pelanggan punya diskon reseller dan kupon
+  sekaligus, yang dipakai hanya yang paling besar. Harga akhir tidak pernah
+  jatuh lebih dalam dari yang kamu niatkan.
+- Kuota kupon dipesan lewat `UPDATE` bersyarat saat order dibuat, jadi kuota
+  tidak bisa kebobolan walau dua pelanggan menekan Beli di detik yang sama.
+- Kalau order dibatalkan atau hangus, slot kupon dikembalikan otomatis.
+- Kupon dilepas dari akun begitu terpakai, jadi tidak diam-diam ikut ke
+  pesanan berikutnya.
+- Nominal dibulatkan turun ke ratusan rupiah supaya angka QRIS enak dibaca.
+- Setiap order menyimpan harga normal, nilai diskon, dan kode kupon, jadi
+  `/stats` bisa menunjukkan total diskon yang sudah kamu berikan.
+- Batas persen 1-90, dijaga di sisi bot maupun database.
+
+Database lama tetap bisa dipakai: kolom baru ditambahkan otomatis lewat
+migrasi `ALTER TABLE` saat bot start.
 
 ---
 
@@ -227,9 +274,16 @@ tidak dirugikan.
 python3 test_vps_bot.py
 ```
 
-14 skenario, termasuk yang biasanya baru ketahuan di produksi: pembayaran dobel,
+17 skenario, termasuk yang biasanya baru ketahuan di produksi: pembayaran dobel,
 provisioning gagal berulang, stop yang error, proses macet, perpanjangan VPS yang
 sudah mati, masa tenggang, dan pelanggan yang mencoba mengakses VPS orang lain.
+Tiga terakhir menguji diskon: kupon terpakai sekali saja, kuota yang habis,
+kupon kedaluwarsa dan nonaktif, pengembalian slot saat order batal atau hangus,
+serta diskon reseller yang tidak bisa ditumpuk dengan kupon.
+
+Tes yang sama dijalankan otomatis di GitHub Actions pada Python 3.9-3.12,
+tanpa satu pun `pip install` - itu sekalian membuktikan janji "standard library
+saja".
 
 Waktu disuntik lewat parameter `now`, jadi skenario 30 hari selesai dalam
 hitungan milidetik.
@@ -246,6 +300,7 @@ vpsbot/
   tg.py                  klien Telegram (urllib, tahan rate limit)
   pakasir.py             QRIS: bikin tagihan, cek status, verifikasi webhook
   handlers.py            perintah, tombol, dan panel admin
+  pricing.py             perhitungan diskon kupon & reseller
   provision.py           jalur pemenuhan order: bikin VPS / perpanjang
   scheduler.py           cek bayar, peringatan, suspend, hapus
   webhook.py             penerima webhook opsional

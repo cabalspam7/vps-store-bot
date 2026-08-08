@@ -27,7 +27,7 @@ os.environ.update({
     "DB_PATH": os.path.join(TMP, "test.db"),
 })
 
-from vpsbot import config, db, handlers, pakasir, provision, scheduler, tg  # noqa: E402
+from vpsbot import config, db, handlers, pakasir, pricing, provision, scheduler, tg  # noqa: E402
 from vpsbot.providers.mock import MockProvisioner  # noqa: E402
 
 USER = 555001
@@ -79,6 +79,19 @@ def buy_callback(plan_id, user=USER):
 def latest_order(user=USER):
     rows = db.list_user_orders(user, 1)
     return rows[0] if rows else None
+
+
+def buy_new_order(user, plan_id="starter"):
+    """Beli lalu ambil order yang benar-benar baru.
+
+    Beberapa order bisa lahir di detik yang sama, jadi urutan created_at tidak
+    bisa dipakai untuk menebak yang terbaru.
+    """
+    before = set(o["id"] for o in db.list_user_orders(user, 50))
+    buy_callback(plan_id, user)
+    fresh = [o for o in db.list_user_orders(user, 50) if o["id"] not in before]
+    check("order baru dibuat untuk " + str(user), len(fresh) == 1, len(fresh))
+    return fresh[0]
 
 
 # --------------------------------------------------------------------- setup
@@ -400,6 +413,172 @@ def test_admin_tools(provider, t0):
     check("non-admin tidak dapat statistik", "Statistik" not in last_text())
 
 
+def test_coupon_discount(t0):
+    print("[15] kupon diskon")
+    user = 555003
+    db.add_coupon("HEMAT20", 20, 0, None, t0)
+
+    handlers.handle_message({
+        "chat": {"id": user},
+        "from": {"id": user, "username": "kuponer"},
+        "text": "/kupon hemat20",
+    })
+    check("kupon diterima & dinormalkan huruf besar", "HEMAT20" in last_text())
+    check("kupon tersimpan di akun", db.get_active_coupon(user) == "HEMAT20")
+
+    body, _ = handlers.plan_detail_view("starter", user)
+    check("harga coret muncul di detail paket", "Bayar" in body and "20.000" in body, body)
+
+    order = buy_new_order(user)
+    check("total dipotong 20%", order["amount"] == 20000, order["amount"])
+    check("harga normal disimpan", order["base_amount"] == 25000, order["base_amount"])
+    check("nilai diskon dicatat", order["discount"] == 5000, order["discount"])
+    check("kode kupon menempel di order", order["coupon_code"] == "HEMAT20")
+
+    coupon = db.get_coupon("HEMAT20")
+    check("pemakaian kupon dihitung", coupon["used"] == 1, coupon["used"])
+    check("kupon dilepas setelah dipakai", db.get_active_coupon(user) is None)
+
+    kedua = buy_new_order(user)
+    check("order berikutnya harga normal", kedua["amount"] == 25000, kedua["amount"])
+    check("kupon tidak terhitung dua kali", db.get_coupon("HEMAT20")["used"] == 1)
+
+
+def test_reseller_discount(t0):
+    print("[16] diskon reseller")
+    admin_id = sorted(config.ADMIN_IDS)[0]
+    user = 555004
+
+    handlers.handle_message({
+        "chat": {"id": admin_id},
+        "from": {"id": admin_id},
+        "text": "/reseller " + str(user) + " 30",
+    })
+    check("reseller tersimpan", db.get_reseller_pct(user) == 30, db.get_reseller_pct(user))
+
+    order = buy_new_order(user)
+    check("total dipotong 30%", order["amount"] == 17500, order["amount"])
+    check("diskon reseller dicatat", order["discount"] == 7500, order["discount"])
+    check("tanpa kode kupon", order["coupon_code"] is None)
+
+    body, _ = handlers.plans_view(user)
+    check("info diskon tampil di daftar paket", "reseller" in body.lower(), body)
+
+    # kupon lebih kecil tidak boleh mengalahkan diskon reseller
+    db.add_coupon("KECIL10", 10, 0, None, t0)
+    handlers.handle_message({
+        "chat": {"id": user},
+        "from": {"id": user},
+        "text": "/kupon KECIL10",
+    })
+    q = pricing.quote(user, 25000)
+    check("yang dipakai diskon terbesar", q["source"] == "reseller" and q["amount"] == 17500, q)
+    check("diskon tidak ditumpuk", q["discount"] == 7500, q)
+
+    handlers.handle_message({
+        "chat": {"id": admin_id},
+        "from": {"id": admin_id},
+        "text": "/reseller " + str(user) + " 0",
+    })
+    check("status reseller bisa dicabut", db.get_reseller_pct(user) == 0)
+
+
+def test_coupon_rules(t0):
+    print("[17] batas kuota, kedaluwarsa, dan pengembalian kupon")
+    admin_id = sorted(config.ADMIN_IDS)[0]
+    user = 555005
+
+    handlers.handle_message({
+        "chat": {"id": admin_id},
+        "from": {"id": admin_id},
+        "text": "/addkupon SEKALI|15|1|30",
+    })
+    coupon = db.get_coupon("SEKALI")
+    check("kupon admin dibuat", coupon is not None and coupon["percent"] == 15, coupon)
+    check("kuota 1 tersimpan", coupon["max_uses"] == 1)
+    check("masa berlaku tersimpan", bool(coupon["expires_at"]))
+
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/kupon SEKALI",
+    })
+    order = buy_new_order(user)
+    # 15% dari 25.000 = 21.250, dibulatkan turun ke ratusan jadi 21.200
+    check("kupon terpakai", order["amount"] == 21200, order["amount"])
+    check("nominal dibulatkan turun ke ratusan", order["discount"] == 3800,
+          order["discount"])
+    check("kuota terpakai penuh", db.get_coupon("SEKALI")["used"] == 1)
+
+    # kuota habis -> pelanggan lain ditolak saat memasang kupon
+    user2 = 555006
+    handlers.handle_message({
+        "chat": {"id": user2}, "from": {"id": user2}, "text": "/kupon SEKALI",
+    })
+    check("kuota habis ditolak", "habis" in last_text().lower(), last_text())
+    check("kupon tidak menempel", db.get_active_coupon(user2) is None)
+
+    # order dibatalkan -> slot kupon kembali
+    handlers.handle_callback({
+        "id": "cb",
+        "from": {"id": user},
+        "data": "cancel:" + order["id"],
+        "message": {"message_id": 11, "chat": {"id": user}},
+    })
+    check("order batal", db.get_order(order["id"])["status"] == "canceled")
+    check("slot kupon dikembalikan", db.get_coupon("SEKALI")["used"] == 0,
+          db.get_coupon("SEKALI")["used"])
+
+    # order hangus -> slot kupon juga kembali
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/kupon SEKALI",
+    })
+    hangus = buy_new_order(user)
+    check("kupon dipakai lagi", db.get_coupon("SEKALI")["used"] == 1)
+    db.expire_stale_orders(now=hangus["expires_at"] + 1)
+    check("order hangus", db.get_order(hangus["id"])["status"] == "expired")
+    check("slot kupon kembali saat hangus", db.get_coupon("SEKALI")["used"] == 0)
+
+    # kupon kedaluwarsa
+    db.add_coupon("KADALUARSA", 50, 0, t0 - DAY, t0)
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/kupon KADALUARSA",
+    })
+    check("kupon kedaluwarsa ditolak", "kedaluwarsa" in last_text().lower(), last_text())
+
+    # kupon dimatikan admin
+    handlers.handle_message({
+        "chat": {"id": admin_id}, "from": {"id": admin_id}, "text": "/delkupon SEKALI",
+    })
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/kupon SEKALI",
+    })
+    check("kupon nonaktif ditolak", "aktif" in last_text().lower(), last_text())
+
+    # kode ngawur
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/kupon NGAWUR123",
+    })
+    check("kode asal ditolak", "tidak ditemukan" in last_text().lower(), last_text())
+
+    # lepas kupon
+    db.set_active_coupon(user, "HEMAT20")
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/kupon hapus",
+    })
+    check("kupon bisa dilepas", db.get_active_coupon(user) is None)
+
+    # daftar kupon untuk admin
+    handlers.handle_message({
+        "chat": {"id": admin_id}, "from": {"id": admin_id}, "text": "/kupons",
+    })
+    check("daftar kupon tampil", "SEKALI" in last_text(), last_text())
+
+    # pelanggan biasa tidak bisa bikin kupon
+    handlers.handle_message({
+        "chat": {"id": user}, "from": {"id": user}, "text": "/addkupon BOCOR|90|0|0",
+    })
+    check("non-admin tidak bisa bikin kupon", db.get_coupon("BOCOR") is None)
+
+
 def main():
     t0 = int(time.time())
     provider = setup()
@@ -418,6 +597,9 @@ def main():
         test_cancel_order(t0)
         test_isolation(provider)
         test_admin_tools(provider, t0)
+        test_coupon_discount(t0)
+        test_reseller_discount(t0)
+        test_coupon_rules(t0)
     finally:
         db.close()
         shutil.rmtree(TMP, ignore_errors=True)
