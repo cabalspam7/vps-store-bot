@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Tidak ada pip install: bot ini murni standard library.
+      # Kalau langkah ini butuh dependency, berarti ada regresi.
+      - name: Periksa sintaks
+        run: python -m compileall -q bot.py vpsbot
+
+      - name: Jalankan tes siklus hidup
+        run: python test_vps_bot.py
